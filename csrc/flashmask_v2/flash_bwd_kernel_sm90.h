@@ -214,6 +214,8 @@ public:
         CollectiveEpilogue epilogue;
         __shared__ __align__(16) int32_t flashmask_smem_[8];
         __shared__ __align__(128) int32_t flashmask_index_smem_[kBlockN * 4];
+        __shared__ int32_t m_block_smem[CollectiveMainloop::Flashmask_m_block_buffer_length];
+        __shared__ bool partially_masked_smem[CollectiveMainloop::Flashmask_m_block_buffer_length];
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
@@ -226,12 +228,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
-            // if(threadIdx.x == 0){
-            //     int producer_num = LoadRegisterRequirement;
-            //     printf("producer_num = %d\n", producer_num);
-            // }
-
+            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             // TODO(heqianyue): some optimization that can be migrated
             // 1. schedulers (using dynamic schedulers): including DualPPTX smem buffer support (some labor)
             // 3. warp group 3, 4 do nothing at all? Can we get rid of them? Put the loader warps to the end
@@ -250,35 +247,27 @@ public:
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, block_coord, params.mainloop);
                 scheduler.producer_notify();
                 if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
-                    
-                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    // auto [n_block, bidh, bidb] = block_coord_;
-                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    mainloop.block_empty_arrive();
+                    mainloop.block_full_sync();
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                smem_pipe_write_do, shared_storage, block_coord, flashmask_smem_);
+                                smem_pipe_write_do, shared_storage, block_coord, flashmask_smem_, m_block_smem);
                     mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
                 } else if (warp_idx_in_warpgroup == 1) {
-                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    // auto [n_block, bidh, bidb] = block_coord_;
-                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, flashmask_smem_);
+                    mainloop.block_empty_arrive();
+                    mainloop.block_full_sync();
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, flashmask_smem_, m_block_smem);
+                } else { // block generator
+                    mainloop.block_empty_sync();
+                    mainloop.generate_m_block(flashmask_smem_, flashmask_index_smem_, m_block_smem, partially_masked_smem, block_coord, params.mainloop, threadIdx.x - cutlass::NumThreadsPerWarp * 2);
                 }
                 scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             }
             // notify the consumer that there is no more work to do
             scheduler.producer_notify();
         } else {  // Consumer
-            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
-            // Initialize matmul objects.
-            // if(cute::elect_one_sync()){
-            //     int mma_num = MmaRegisterRequirement;
-            //     printf("mma_num = %d\n", mma_num);
-            // }
+            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             TiledMmadKV tiled_mma_dKV;
 
             PipelineState smem_pipe_read;
@@ -299,10 +288,12 @@ public:
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                
+
+                mainloop.block_empty_arrive();
+                mainloop.block_full_sync();
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_, m_block_smem, partially_masked_smem);
                 if (tile_valid) {
                     binary_work_idx = 1 - binary_work_idx;
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,

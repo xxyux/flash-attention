@@ -76,10 +76,13 @@ enum class BwdNamedBarriers {
     FlashmaskSmemFull = 3,
     dQEmptyWG1 = 4,
     dQEmptyWG2 = 5,
-    dQEmptyWG3 = 6,
+    // Note(umiswing): num of mma wg is always 2 in fm3
+    // dQEmptyWG3 = 6,
+    BlockEmpty = 6,
     dQFullWG1 = 7,
     dQFullWG2 = 8,
-    dQFullWG3 = 9,
+    // dQFullWG3 = 9,
+    BlockFull = 9,
     FlashmaskProducer = 0,  // HACK: KVEmpty sync is unused
 };
 
