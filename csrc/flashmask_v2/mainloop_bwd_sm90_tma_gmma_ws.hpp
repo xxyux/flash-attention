@@ -77,7 +77,7 @@ struct CollectiveMainloopBwdSm90 {
     // static constexpr int Flashmask_m_block_buffer_length = (16 * 1024 + kBlockM - 1) / kBlockM + 1;
     // Note(umiswing): make sure the buffer length is divisible by NumGeneratorThreads to avoid divergent,
     // makes it easer to manage barrier
-    static constexpr int Flashmask_m_block_buffer_length = (((64 + kBlockM - 1) / kBlockM) + NumGeneratorThreads - 1) / NumGeneratorThreads * NumGeneratorThreads + 1;
+    static constexpr int Flashmask_m_block_buffer_length = (((16 * 1024 + kBlockM - 1) / kBlockM) + NumGeneratorThreads - 1) / NumGeneratorThreads * NumGeneratorThreads + 1;
     static constexpr int Flashmask_m_block_buffer_valid_length = Flashmask_m_block_buffer_length - 1;
     static constexpr int Flashmask_m_block_finish = -1;
     static constexpr int Flashmask_m_block_chunk_end = -2;
@@ -499,6 +499,16 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
+/*
+只会读写一次：
+1. fm_mem: 8个数，上下两个部分，每个部分up和down的max/min
+2. flashmask_index_smem_: 具体的每一列上下部分的up和down，size=[4 * kBlockN]
+
+buffer长度有限，会循环：
+3. m_block_smem: 队列，m-block的idx
+4. partially_masked_smem: 与m_block_smem配套, true(部分mask) or false(全部mask)
+*/
+
     CUTLASS_DEVICE
     void generate_m_block( int32_t *  fm_mem, int32_t * flashmask_index_smem_, int32_t * const m_block_smem, bool * const partially_masked_smem, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params, const int thread_idx) {
         auto [n_block, bidh, bidb] = block_coord;
@@ -535,66 +545,90 @@ struct CollectiveMainloopBwdSm90 {
         }
         int const row_offset = bh_offset * seqlen + n_block * kBlockN;
         constexpr int threads_num = cutlass::NumThreadsPerWarp * 2;
-
         #pragma unroll
         for(int idx = thread_idx; idx < kBlockN; idx += threads_num) {
-        const bool in_range = n_block * kBlockN + idx < seqlen;
+            const bool in_range = n_block * kBlockN + idx < seqlen;
 
-            flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MAX;
+            flashmask_index_smem_[idx] = in_range ? params.lt_start_ptr[idx + row_offset] : INT_MAX;
             if constexpr (Has_lt_end) {
-                flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
+                flashmask_index_smem_[idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[idx + row_offset] : INT_MAX) : INT_MAX;
             } else {
-                flashmask_index_smem_[thread_idx + kBlockN] = INT_MAX;
+                flashmask_index_smem_[idx + kBlockN] = INT_MAX;
             }
             if constexpr (!Is_causal) {
                 // Note(heqianyue): make sure that `Is_causal` masks are actually causal (no unmasked elements on upper triangle)
                 if constexpr (Has_ut_start) {
-                    flashmask_index_smem_[thread_idx + 2 * kBlockN] = in_range ? params.ut_start_ptr[thread_idx + row_offset] : INT_MAX;
+                    flashmask_index_smem_[idx + 2 * kBlockN] = in_range ? params.ut_start_ptr[idx + row_offset] : INT_MAX;
                 }
                 // if causal, Has_ut_start won't be true, so if 'Is_causal' == true, ut_end loading and int branching can be skipped in its entirity
-                flashmask_index_smem_[thread_idx + 3 * kBlockN] = in_range ? params.ut_end_ptr[thread_idx + row_offset] : INT_MIN;
+                flashmask_index_smem_[idx + 3 * kBlockN] = in_range ? params.ut_end_ptr[idx + row_offset] : INT_MIN;
             }
         }
-
         // Note(umiswing): PPT Scheduler use FlashmaskProducer to sync all 128 threads of the producer wg in get_next_work(),
         // but it is safe to resue bar FlashmaskProducer here.
         cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
         // Note(umiswing): make sure loop_end >= m_block
         auto align_loop_end = [&](int loop_end, int m_block, int threads_num) -> int {
-          return loop_end + ((loop_end - m_block) + threads_num - 1) / threads_num * threads_num - 1;
+          return m_block + ((loop_end - m_block) + threads_num - 1) / threads_num * threads_num;
         };
         int m_block = m_block_min;
         int loop_end = m_block_max;
-        int offset = thread_idx;
-
+        int m_block_base = 0; // smem的base offset
         // '_excl' for exclusive
         auto fill_block = [&](int loop_end, bool partially_masked) -> void {
           // Note(umiswing): make sure all threads reache the last loop iter to avoid deadlock
           // umiswing: will loop_end < m_block?
           // two conds to prevent deadlock: 1. m_block + threads_num - 1 < xxx 2.
+          int base = m_block;
           #pragma unroll
           for(int blk_idx = m_block + thread_idx; blk_idx < align_loop_end(loop_end, m_block, threads_num); blk_idx += threads_num) {
-            if(blockIdx.x == 0) {
-              printf("\nwsm debug offset:%d, threadIdx.x:%d, loop_end:%d, m_block:%d, threads_num:%d, blk_idx:%d, align_loop_end:%d\n",
-                                  offset,    threadIdx.x,    loop_end,    m_block,    threads_num,    blk_idx,    align_loop_end(loop_end, m_block, threads_num));
+            int tile_size = min(threads_num, loop_end - base);
+
+            // 写不满smem buffer
+            if(m_block_base + tile_size < Flashmask_m_block_buffer_valid_length) {
+                int m_block_smem_idx = m_block_base + thread_idx;
+                if (blk_idx < loop_end) {
+                    m_block_smem[m_block_smem_idx] = blk_idx;
+                    partially_masked_smem[m_block_smem_idx] = partially_masked;
+                }
+                m_block_base += tile_size;
             }
-            // Note(umiswing): we make sure that no divergent branch in this cond,
-            // since the buffer length is always divisible by threads_num
-            if(offset >= Flashmask_m_block_buffer_valid_length) {
-              if(thread_idx == 0) {
-                m_block_smem[offset] = Flashmask_m_block_chunk_end;
-              }
-              block_full_arrive();
-              block_empty_sync();
-              offset -= Flashmask_m_block_buffer_valid_length;
+            else { // 写满smem buffer，需要写2次
+                if(m_block_base + thread_idx < Flashmask_m_block_buffer_valid_length) { // 第一次写
+                    int m_block_smem_idx = m_block_base + thread_idx;
+                    m_block_smem[m_block_smem_idx] = blk_idx;
+                    partially_masked_smem[m_block_smem_idx] = partially_masked;
+                }
+                if(thread_idx == 0) { // 写end
+                    m_block_smem[Flashmask_m_block_buffer_valid_length] = Flashmask_m_block_chunk_end;
+                }
+                block_full_arrive();// 发送commit
+                block_empty_sync();
+                if(m_block_base + thread_idx >= Flashmask_m_block_buffer_valid_length && blk_idx < loop_end) { //第二次写
+                    int m_block_smem_idx = (m_block_base + thread_idx) % Flashmask_m_block_buffer_valid_length;
+                    m_block_smem[m_block_smem_idx] = blk_idx;
+                    partially_masked_smem[m_block_smem_idx] = partially_masked;
+                }
+                m_block_base = (m_block_base + tile_size) % Flashmask_m_block_buffer_valid_length; // reset
             }
-            if (blk_idx < loop_end) {
-              m_block_smem[offset] = blk_idx;
-              partially_masked_smem[offset] = partially_masked;
-            }
-            offset += threads_num;
+            // 更新base
+            base += threads_num;
           }
         };
+
+        // auto fill_block = [&](int loop_end, bool partially_masked) -> void {
+        //     if(thread_idx == 0) {
+        //         for(int blk_idx = m_block; blk_idx < loop_end; blk_idx++) {
+        //             m_block_smem[m_block_base] = blk_idx;
+        //             partially_masked_smem[m_block_base] = partially_masked;
+        //             m_block_base++;
+        //             if(m_block_base == Flashmask_m_block_buffer_valid_length) {
+        //                 m_block_smem[m_block_base] = Flashmask_m_block_chunk_end;
+        //                 m_block_base = 0;
+        //             }
+        //         }
+        //     }
+        // };
 
         if constexpr(!Is_causal) {
           if constexpr(Has_ut_start) {
@@ -610,7 +644,6 @@ struct CollectiveMainloopBwdSm90 {
           m_block = std::max(m_block, fm_mem[7]/*ut_end_nblockmin*/);
           loop_end = std::min(fm_mem[6]/*ut_end_nblockmax*/, m_block_max-1);
           fill_block(loop_end + 1, true);
-
           m_block = std::max(m_block, loop_end + 1);
         }
         loop_end = std::min(fm_mem[1]/*lt_start_nblockmin*/, m_block_max);
@@ -626,9 +659,8 @@ struct CollectiveMainloopBwdSm90 {
           m_block = std::max(m_block, loop_end + 1);
           fill_block(m_block_max, false);
         }
-
         if(thread_idx == 0) {
-          m_block_smem[offset] = Flashmask_m_block_finish;
+          m_block_smem[m_block_base] = Flashmask_m_block_finish;
         }
         block_full_arrive();
     }
@@ -636,87 +668,21 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE
     void block_full_arrive() {
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup * 1, static_cast<uint32_t>(BwdNamedBarriers::BlockFull) /*id*/);
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load full arrive\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq full arrive\n");
-          } else if(threadIdx.x >= 64 && threadIdx.x < 128) {
-            printf("\nwsm debug generator full arrive threadIdx.x:%d\n", threadIdx.x);
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma full arrive\n");
-          }
-        }
     }
 
     CUTLASS_DEVICE
     void block_empty_arrive() {
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarpGroup * 1, static_cast<uint32_t>(BwdNamedBarriers::BlockEmpty) /*id*/);
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load empty arrive\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq empty arrive\n");
-          } else if(threadIdx.x == 64) {
-            printf("\nwsm debug generator empty arrive\n");
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma empty arrive\n");
-          }
-        }
     }
 
     CUTLASS_DEVICE
     void block_full_sync(){
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load full before sync\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq full before sync\n");
-          } else if(threadIdx.x == 64) {
-            printf("\nwsm debug generator full before sync\n");
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma full before sync\n");
-          }
-        }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarpGroup * 1, static_cast<uint32_t>(BwdNamedBarriers::BlockFull) /*id*/);
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load full after sync\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq full after sync\n");
-          } else if(threadIdx.x == 64) {
-            printf("\nwsm debug generator full after sync\n");
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma full after sync\n");
-          }
-        }
     }
 
     CUTLASS_DEVICE
     void block_empty_sync() {
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load empty before sync\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq empty before sync\n");
-          } else if(threadIdx.x == 64) {
-            printf("\nwsm debug generator empty before sync\n");
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma empty before sync\n");
-          }
-        }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarpGroup * 1, static_cast<uint32_t>(BwdNamedBarriers::BlockEmpty) /*id*/);
-        if(blockIdx.x == 0) {
-          if(threadIdx.x == 0) {
-            printf("\nwsm debug load empty after sync\n");
-          } else if(threadIdx.x == 32) {
-            printf("\nwsm debug store_dq empty after sync\n");
-          } else if(threadIdx.x == 64) {
-            printf("\nwsm debug generator empty after sync\n");
-          } else if(threadIdx.x == 128) {
-            printf("\nwsm debug mma empty after sync\n");
-          }
-        }
     }
 
     template <typename SharedStorage>
@@ -814,43 +780,44 @@ struct CollectiveMainloopBwdSm90 {
         int lane_predicate = cute::elect_one_sync();
         // Wait for the MMA warpgroups to say that smem_k and smem_v are ready
         // cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
-
-        int m_block_idx = 0;
-        #pragma unroll (kHeadDim < 256 ? 2 : 1)
-        for(int m_block = m_block_smem[m_block_idx]; m_block != Flashmask_m_block_finish;) {
-          if(m_block != Flashmask_m_block_chunk_end) {
+        
         if (lane_predicate) {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
             copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
             copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
-
-            auto process_block = [&](int m_block) {
-                // If Q and dO have the same number of stages, we can use the same pipeline state variable
-                // to reduce registers
-                pipeline_q.producer_acquire(smem_pipe_write);
-                copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                    tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
-                copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                    gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
-                PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
-                pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                     tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
-
-                copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
-                     gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
-                if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                ++smem_pipe_write;
-            };
-            process_block(m_block);
         }
-          ++m_block_idx;
-        } else {
-          block_empty_arrive();
-          m_block_idx = 0;
-          block_full_sync();
-        }
-        m_block = m_block_smem[m_block_idx];
+        int m_block_idx = 0;
+        #pragma unroll (kHeadDim < 256 ? 2 : 1)
+        for(int m_block = m_block_smem[m_block_idx]; m_block != Flashmask_m_block_finish;) {
+            if(m_block != Flashmask_m_block_chunk_end) {
+                if (lane_predicate) {
+                    auto process_block = [&](int m_block) {
+                        // If Q and dO have the same number of stages, we can use the same pipeline state variable
+                        // to reduce registers
+                        pipeline_q.producer_acquire(smem_pipe_write);
+                        copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                            tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                        copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                            gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                            tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
+
+                        copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                            gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                        ++smem_pipe_write;
+                    };
+                    process_block(m_block);
+                }
+                ++m_block_idx;
+            } else {
+                block_empty_arrive();
+                m_block_idx = 0;
+                block_full_sync();
+            }
+            m_block = m_block_smem[m_block_idx];
         }
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
@@ -933,37 +900,38 @@ struct CollectiveMainloopBwdSm90 {
 
         int m_block_idx = 0;
 
-                #pragma unroll 2
-                for (int m_block = m_block_smem[m_block_idx]; m_block != Flashmask_m_block_finish;) {
-                  if (m_block != Flashmask_m_block_chunk_end) {
-                    if constexpr (Deterministic) {
-                        Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
-                    }
-                    #pragma unroll
-                    for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
-                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
-                        if (lane_predicate) {
-                            //cute::print_tensor(sdQ);
-                            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
-                            tma_store_arrive();
-                        }
-                    }
-                    // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
-                    for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
-                        if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
-                        cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
-                    });
-                    if constexpr (Deterministic) {
-                        Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
-                    }
-                  } else {
-                    block_empty_arrive();
-                    m_block_idx = 0;
-                    block_full_sync();
-                  }
-                  m_block = m_block_smem[m_block_idx];
+        #pragma unroll 2
+        for (int m_block = m_block_smem[m_block_idx]; m_block != Flashmask_m_block_finish;) {
+            if (m_block != Flashmask_m_block_chunk_end) {
+                if constexpr (Deterministic) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
                 }
-
+                #pragma unroll
+                for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+                    if (lane_predicate) {
+                        //cute::print_tensor(sdQ);
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        tma_store_arrive();
+                    }
+                }
+                // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
+                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
+                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
+                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
+                });
+                if constexpr (Deterministic) {
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                }
+                ++m_block_idx;
+            } 
+            else {
+                block_empty_arrive();
+                m_block_idx = 0;
+                block_full_sync();
+            }
+            m_block = m_block_smem[m_block_idx];
+        }
         static_assert(!Deterministic);
         // TODO(umiswing): support deterministic
 #if 0
@@ -1355,3 +1323,4 @@ struct CollectiveMainloopBwdSm90 {
 };
 
 } // namespace flash
+

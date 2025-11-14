@@ -228,7 +228,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             // TODO(heqianyue): some optimization that can be migrated
             // 1. schedulers (using dynamic schedulers): including DualPPTX smem buffer support (some labor)
             // 3. warp group 3, 4 do nothing at all? Can we get rid of them? Put the loader warps to the end
@@ -267,7 +267,7 @@ public:
             // notify the consumer that there is no more work to do
             scheduler.producer_notify();
         } else {  // Consumer
-            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             TiledMmadKV tiled_mma_dKV;
 
             PipelineState smem_pipe_read;
@@ -311,3 +311,4 @@ public:
 };
 
 } // namespace flash
+
